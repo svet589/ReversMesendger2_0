@@ -22,6 +22,7 @@ export const db = createClient({ url, authToken: token });
    ============================================================ */
 
 export async function initSchema() {
+  // --- Пользователи ---
   await db.execute(`
     CREATE TABLE IF NOT EXISTS users (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -36,6 +37,7 @@ export async function initSchema() {
     ON users(username);
   `);
 
+  // --- Сообщения ---
   await db.execute(`
     CREATE TABLE IF NOT EXISTS messages (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,7 +59,56 @@ export async function initSchema() {
     ON messages(to_user, status);
   `);
 
+  // --- Чаты ---
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS chats (
+      id         TEXT PRIMARY KEY,
+      user_a     TEXT NOT NULL,
+      user_b     TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      created_by TEXT NOT NULL
+    );
+  `);
+
+  await db.execute(`
+    CREATE INDEX IF NOT EXISTS idx_chats_user_a
+    ON chats(user_a);
+  `);
+
+  await db.execute(`
+    CREATE INDEX IF NOT EXISTS idx_chats_user_b
+    ON chats(user_b);
+  `);
+
   console.log('✅ Схема БД готова');
+}
+
+/* ============================================================
+   Миграции
+   ============================================================ */
+
+export async function runMigrations() {
+  const migrations = [
+    `ALTER TABLE users ADD COLUMN display_name TEXT`,
+    `ALTER TABLE users ADD COLUMN avatar_emoji TEXT DEFAULT '🙂'`,
+    `ALTER TABLE users ADD COLUMN bio TEXT DEFAULT ''`
+  ];
+
+  for (const sql of migrations) {
+    try {
+      await db.execute(sql);
+      console.log(`   ✅ ${sql.slice(0, 60)}…`);
+    } catch (e) {
+      if (e.message && e.message.includes('duplicate column name')) {
+        console.log(`   ⏭  уже есть: ${sql.slice(0, 60)}…`);
+      } else {
+        console.log(`   ❌ ${sql.slice(0, 60)}…`);
+        console.log(`      ${e.message}`);
+      }
+    }
+  }
+
+  console.log('✅ Миграции применены');
 }
 
 /* ============================================================
@@ -66,7 +117,10 @@ export async function initSchema() {
 
 export async function findUserByUsername(username) {
   const res = await db.execute({
-    sql: 'SELECT * FROM users WHERE username = ? LIMIT 1',
+    sql: `SELECT
+            id, username, password_hash, created_at,
+            display_name, avatar_emoji, bio
+          FROM users WHERE username = ? LIMIT 1`,
     args: [username]
   });
   return res.rows[0] || null;
@@ -86,6 +140,30 @@ export async function userExists(username) {
     args: [username]
   });
   return res.rows.length > 0;
+}
+
+export async function updateUser(username, fields) {
+  const allowed = ['display_name', 'avatar_emoji', 'bio'];
+  const updates = [];
+  const args = [];
+
+  for (const key of allowed) {
+    if (fields[key] !== undefined) {
+      updates.push(`${key} = ?`);
+      args.push(fields[key]);
+    }
+  }
+
+  if (updates.length === 0) return null;
+
+  args.push(username);
+
+  await db.execute({
+    sql: `UPDATE users SET ${updates.join(', ')} WHERE username = ?`,
+    args
+  });
+
+  return findUserByUsername(username);
 }
 
 /* ============================================================
@@ -123,25 +201,6 @@ export async function getHistory(userA, userB, limit = 200) {
   return res.rows;
 }
 
-export async function getChatsForUser(username) {
-  const res = await db.execute({
-    sql: `
-      SELECT
-        CASE
-          WHEN from_user = ? THEN to_user
-          ELSE from_user
-        END AS peer,
-        MAX(created_at) AS last_ts
-      FROM messages
-      WHERE from_user = ? OR to_user = ?
-      GROUP BY peer
-      ORDER BY last_ts DESC
-    `,
-    args: [username, username, username]
-  });
-  return res.rows;
-}
-
 export async function getLastMessage(userA, userB) {
   const res = await db.execute({
     sql: `
@@ -161,6 +220,59 @@ export async function getLastMessage(userA, userB) {
     args: [userA, userB, userB, userA]
   });
   return res.rows[0] || null;
+}
+
+/* ============================================================
+   Чаты
+   ============================================================ */
+
+export function makeChatId(userA, userB) {
+  const [a, b] = [userA, userB].sort();
+  return `${a}__${b}`;
+}
+
+export async function createChat(userA, userB) {
+  const id = makeChatId(userA, userB);
+  const [a, b] = [userA, userB].sort();
+
+  const existing = await db.execute({
+    sql: 'SELECT * FROM chats WHERE id = ? LIMIT 1',
+    args: [id]
+  });
+
+  if (existing.rows.length > 0) {
+    return existing.rows[0];
+  }
+
+  const now = Date.now();
+  await db.execute({
+    sql: `INSERT INTO chats (id, user_a, user_b, created_at, created_by)
+          VALUES (?, ?, ?, ?, ?)`,
+    args: [id, a, b, now, userA]
+  });
+
+  return { id, user_a: a, user_b: b, created_at: now, created_by: userA };
+}
+
+export async function getChatsForUser(username) {
+  const res = await db.execute({
+    sql: `
+      SELECT id, user_a, user_b, created_at
+      FROM chats
+      WHERE user_a = ? OR user_b = ?
+      ORDER BY created_at DESC
+    `,
+    args: [username, username]
+  });
+  return res.rows;
+}
+
+export async function deleteChat(userA, userB) {
+  const id = makeChatId(userA, userB);
+  await db.execute({
+    sql: 'DELETE FROM chats WHERE id = ?',
+    args: [id]
+  });
 }
 
 /* ============================================================
@@ -200,4 +312,4 @@ export async function getPendingMessages(toUser) {
     args: [toUser]
   });
   return res.rows;
-}
+    }
