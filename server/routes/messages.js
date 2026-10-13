@@ -6,9 +6,9 @@ import { Router } from 'express';
 import { requireAuth } from '../auth.js';
 import {
   getHistory,
-  getChatsForUser,
   getLastMessage,
-  userExists
+  userExists,
+  findUserByUsername
 } from '../db.js';
 import { isOnline } from '../ws.js';
 import { LIMITS } from '../../shared/protocol.js';
@@ -17,26 +17,48 @@ const router = Router();
 
 /* ------------------------------------------------------------
    GET /api/messages/chats
-   Список чатов пользователя с последним сообщением
+   Список чатов с последним сообщением.
+   ВАЖНО: этот роут теперь ДУБЛИРУЕТ /api/chats, оставлен для
+   обратной совместимости со старым клиентом.
    ------------------------------------------------------------ */
 
 router.get('/chats', requireAuth, async (req, res) => {
   try {
     const me = req.username;
-    const rows = await getChatsForUser(me);
+
+    // Ищем все уникальные peer'ы из сообщений, где участвует me
+    const { db } = await import('../db.js');
+    const rows = await db.execute({
+      sql: `
+        SELECT
+          CASE
+            WHEN from_user = ? THEN to_user
+            ELSE from_user
+          END AS peer,
+          MAX(created_at) AS last_ts
+        FROM messages
+        WHERE from_user = ? OR to_user = ?
+        GROUP BY peer
+        ORDER BY last_ts DESC
+      `,
+      args: [me, me, me]
+    });
 
     const chats = [];
 
-    for (const row of rows) {
+    for (const row of rows.rows) {
       const peer = row.peer;
-      const last = await getLastMessage(me, peer);
-      const exists = await userExists(peer);
+      const user = await findUserByUsername(peer);
 
-      if (!exists) continue;
+      if (!user) continue;
+
+      const last = await getLastMessage(me, peer);
 
       chats.push({
         id: peer,
         name: peer,
+        displayName: user.display_name || '',
+        avatarEmoji: user.avatar_emoji || '🙂',
         online: isOnline(peer),
         lastTs: row.last_ts,
         lastText: last ? last.text : '',
@@ -54,7 +76,7 @@ router.get('/chats', requireAuth, async (req, res) => {
 
 /* ------------------------------------------------------------
    GET /api/messages/:peer
-   История переписки с конкретным пользователем
+   История переписки с конкретным пользователем.
    ------------------------------------------------------------ */
 
 router.get('/:peer', requireAuth, async (req, res) => {
