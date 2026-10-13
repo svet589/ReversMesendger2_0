@@ -94,3 +94,5 @@ export function requireAuth(req, res, next) {
   req.username = payload.username;
   next();
 }
+
+export default router;
