@@ -7,11 +7,12 @@ import cors from 'cors';
 import http from 'http';
 import dotenv from 'dotenv';
 
-import { initSchema } from './db.js';
+import { initSchema, runMigrations } from './db.js';
 import { setupWebSocket } from './ws.js';
 import authRoutes from './routes/auth.js';
 import messageRoutes from './routes/messages.js';
 import userRoutes from './routes/users.js';
+import chatRoutes from './routes/chats.js';
 
 dotenv.config();
 
@@ -34,11 +35,8 @@ const app = express();
 
 app.use(cors({
   origin(origin, cb) {
-    // Разрешаем запросы без origin (curl, мобильные приложения)
     if (!origin) return cb(null, true);
-    // Разрешаем всё, если в .env стоит *
     if (ALLOWED_ORIGINS.includes('*')) return cb(null, true);
-    // Иначе — только из белого списка
     if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
     cb(new Error('CORS: origin не разрешён'));
   },
@@ -66,6 +64,7 @@ app.get('/api/health', (req, res) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/chats', chatRoutes);
 
 /* ------------------------------------------------------------
    404
@@ -101,6 +100,7 @@ setupWebSocket(server);
 (async () => {
   try {
     await initSchema();
+    await runMigrations();
 
     server.listen(PORT, () => {
       console.log('');
@@ -129,7 +129,6 @@ function shutdown(signal) {
     console.log('Сервер остановлен');
     process.exit(0);
   });
-  // Принудительно через 5 секунд
   setTimeout(() => process.exit(1), 5000);
 }
 
