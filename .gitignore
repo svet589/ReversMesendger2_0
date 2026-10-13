@@ -1,0 +1,56 @@
+# Зависимости
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Переменные окружения
+.env
+.env.local
+.env.*.local
+
+# Логи
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Сборки
+dist/
+build/
+out/
+
+# Android / Capacitor
+android/
+ios/
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# Кэш
+.cache/
+.parcel-cache/
+.eslintcache
+
+# Редакторы
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ОС
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Turso локальные файлы
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Render
+.render/
