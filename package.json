@@ -1,0 +1,26 @@
+{
+  "name": "revers-messenger-2-0",
+  "version": "0.1.0",
+  "description": "Минимальный мессенджер для приватной переписки",
+  "type": "module",
+  "main": "server/index.js",
+  "private": true,
+  "scripts": {
+    "dev": "node --watch server/index.js",
+    "start": "node server/index.js",
+    "init-db": "node scripts/init-db.js"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.6.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "ws": "^8.17.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "AGPL-3.0-or-later"
+}
