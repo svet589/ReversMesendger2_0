@@ -1,7 +1,7 @@
 {
   "appId": "com.revers.messenger",
   "appName": "REVERS",
-  "webDir": "client",
+  "webDir": "docs",
   "bundledWebRuntime": false,
 
   "server": {
