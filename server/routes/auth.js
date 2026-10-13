@@ -4,8 +4,8 @@
 
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { findUserByUsername, createUser } from './db.js';
-import { isValidUsername, isValidPassword } from '../shared/protocol.js';
+import { findUserByUsername, createUser } from '../db.js';
+import { isValidUsername, isValidPassword } from '../../shared/protocol.js';
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_TTL    = '30d';
