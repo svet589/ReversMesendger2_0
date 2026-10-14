@@ -8,12 +8,19 @@ import {
   saveMessage,
   markDelivered,
   markRead,
-  getPendingMessages
+  getPendingMessages,
+  getMessageById,
+  editMessage,
+  softDeleteMessage,
+  addOrUpdateReaction,
+  removeReaction,
+  pinMessage,
+  unpinMessage,
+  getPinned
 } from './db.js';
 import {
   WS_TYPES,
   isValidMessage,
-  pack,
   unpack
 } from '../shared/protocol.js';
 
@@ -37,7 +44,6 @@ export function setupWebSocket(httpServer) {
     handleConnection(ws, req);
   });
 
-  // Периодический ping для keep-alive
   const pingInterval = setInterval(() => {
     wss.clients.forEach((ws) => {
       if (ws.isAlive === false) {
@@ -55,25 +61,20 @@ export function setupWebSocket(httpServer) {
 }
 
 /* ============================================================
-   Обработка одного соединения
+   Обработка соединения
    ============================================================ */
 
 async function handleConnection(ws, req) {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
 
-  // --- Аутентификация по токену из query ---
   let username = null;
   try {
     const url = new URL(req.url, 'http://localhost');
     const token = url.searchParams.get('token');
     const payload = token ? verifyToken(token) : null;
-    if (payload && payload.username) {
-      username = payload.username;
-    }
-  } catch (e) {
-    username = null;
-  }
+    if (payload && payload.username) username = payload.username;
+  } catch (e) { username = null; }
 
   if (!username) {
     safeSend(ws, { type: WS_TYPES.ERROR, message: 'Unauthorized' });
@@ -83,62 +84,40 @@ async function handleConnection(ws, req) {
 
   ws.username = username;
 
-  // --- Регистрируем клиента ---
-  if (!clients.has(username)) {
-    clients.set(username, new Set());
-  }
+  if (!clients.has(username)) clients.set(username, new Set());
   clients.get(username).add(ws);
 
   console.log(`🔌 ${username} подключён. Всего онлайн: ${clients.size}`);
 
-  // --- Приветствие ---
   safeSend(ws, { type: WS_TYPES.READY, username });
 
-  // --- Доставляем накопившиеся сообщения ---
   await flushPending(ws, username);
-
-  // --- Сообщаем остальным о появлении ---
   broadcastPresence(username, true);
 
-  // --- Обработка входящих сообщений ---
   ws.on('message', async (raw) => {
     const msg = unpack(raw.toString());
     if (!msg) return;
 
     try {
       switch (msg.type) {
-        case WS_TYPES.MESSAGE:
-          await handleMessage(ws, msg);
-          break;
-
-        case WS_TYPES.TYPING:
-          handleTyping(ws, msg);
-          break;
-
-        case WS_TYPES.READ:
-          await handleRead(ws, msg);
-          break;
-
-        case WS_TYPES.PING:
-          safeSend(ws, { type: WS_TYPES.PONG });
-          break;
-
+        case WS_TYPES.MESSAGE:  await handleMessage(ws, msg);  break;
+        case WS_TYPES.TYPING:   handleTyping(ws, msg);         break;
+        case WS_TYPES.READ:     await handleRead(ws, msg);     break;
+        case 'edit':            await handleEdit(ws, msg);     break;
+        case 'delete':          await handleDelete(ws, msg);   break;
+        case 'reaction':        await handleReaction(ws, msg); break;
+        case 'pin':             await handlePin(ws, msg);      break;
+        case 'unpin':           await handleUnpin(ws, msg);    break;
+        case WS_TYPES.PING:     safeSend(ws, { type: WS_TYPES.PONG }); break;
         default:
-          safeSend(ws, {
-            type: WS_TYPES.ERROR,
-            message: 'Неизвестный тип сообщения'
-          });
+          safeSend(ws, { type: WS_TYPES.ERROR, message: 'Неизвестный тип' });
       }
     } catch (e) {
       console.error('[ws] handler error:', e);
-      safeSend(ws, {
-        type: WS_TYPES.ERROR,
-        message: e.message || 'Ошибка сервера'
-      });
+      safeSend(ws, { type: WS_TYPES.ERROR, message: e.message || 'Ошибка' });
     }
   });
 
-  // --- Отключение ---
   ws.on('close', () => {
     const set = clients.get(username);
     if (set) {
@@ -157,26 +136,23 @@ async function handleConnection(ws, req) {
 }
 
 /* ============================================================
-   Обработчики типов сообщений
+   Message
    ============================================================ */
 
 async function handleMessage(ws, msg) {
   const from = ws.username;
   const to = String(msg.to || '').toLowerCase().trim();
   const text = String(msg.text || '');
+  const replyToId = msg.replyToId ? Number(msg.replyToId) : null;
 
-  if (!to) {
-    return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Не указан получатель' });
-  }
-  if (to === from) {
-    return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Нельзя писать себе' });
-  }
-  if (!isValidMessage(text)) {
-    return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Неверный текст сообщения' });
-  }
+  if (!to) return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Не указан получатель' });
+  if (to === from) return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Нельзя писать себе' });
+  if (!isValidMessage(text)) return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Неверный текст' });
 
-  // Сохраняем в БД
-  const { id, ts } = await saveMessage(from, to, text);
+  const { id, ts } = await saveMessage(from, to, text, replyToId);
+
+  // Получаем полную запись, чтобы вернуть reply данные
+  const full = await getMessageById(id);
 
   const payload = {
     type: WS_TYPES.NEW_MESSAGE,
@@ -185,10 +161,20 @@ async function handleMessage(ws, msg) {
     to,
     text,
     ts,
-    status: 'sent'
+    status: 'sent',
+    replyToId,
+    replyText: null
   };
 
-  // Пытаемся доставить получателю
+  // Если это ответ — подгружаем текст цитируемого сообщения
+  if (replyToId) {
+    const replied = await getMessageById(replyToId);
+    if (replied) {
+      payload.replyText = replied.deleted ? '[сообщение удалено]' : replied.text;
+      payload.replyFrom = replied.from;
+    }
+  }
+
   const sockets = clients.get(to);
   let delivered = false;
 
@@ -199,12 +185,9 @@ async function handleMessage(ws, msg) {
         delivered = true;
       }
     }
-    if (delivered) {
-      await markDelivered([id]);
-    }
+    if (delivered) await markDelivered([id]);
   }
 
-  // Отправителю — подтверждение
   safeSend(ws, {
     type: WS_TYPES.DELIVERED,
     id,
@@ -212,6 +195,10 @@ async function handleMessage(ws, msg) {
     ts
   });
 }
+
+/* ============================================================
+   Typing
+   ============================================================ */
 
 function handleTyping(ws, msg) {
   const from = ws.username;
@@ -228,11 +215,13 @@ function handleTyping(ws, msg) {
   });
 
   for (const sock of sockets) {
-    if (sock.readyState === 1) {
-      sock.send(payload);
-    }
+    if (sock.readyState === 1) sock.send(payload);
   }
 }
+
+/* ============================================================
+   Read
+   ============================================================ */
 
 async function handleRead(ws, msg) {
   const from = ws.username;
@@ -245,7 +234,8 @@ async function handleRead(ws, msg) {
   if (sockets) {
     const payload = JSON.stringify({
       type: WS_TYPES.READ_ACK,
-      by: from
+      from,
+      peer
     });
     for (const sock of sockets) {
       if (sock.readyState === 1) sock.send(payload);
@@ -254,8 +244,168 @@ async function handleRead(ws, msg) {
 }
 
 /* ============================================================
-   Доставка непрочитанных
+   Edit
    ============================================================ */
+
+async function handleEdit(ws, msg) {
+  const from = ws.username;
+  const id = Number(msg.id);
+  const text = String(msg.text || '');
+
+  if (!id || !isValidMessage(text)) {
+    return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Неверные данные' });
+  }
+
+  const original = await getMessageById(id);
+  if (!original) return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Сообщение не найдено' });
+  if (original.from !== from) return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Не ваше сообщение' });
+  if (original.deleted) return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Сообщение удалено' });
+
+  const updated = await editMessage(id, from, text);
+
+  const payload = {
+    type: 'message_edited',
+    id,
+    from: updated.from,
+    to: updated.to,
+    text: updated.text,
+    editedAt: updated.edited_at,
+    ts: updated.ts
+  };
+
+  sendToBoth(updated.from, updated.to, payload);
+}
+
+/* ============================================================
+   Delete
+   ============================================================ */
+
+async function handleDelete(ws, msg) {
+  const from = ws.username;
+  const id = Number(msg.id);
+  const forAll = Boolean(msg.forAll);
+
+  if (!id) return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Неверные данные' });
+
+  const original = await getMessageById(id);
+  if (!original) return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Сообщение не найдено' });
+  if (original.from !== from) return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Не ваше сообщение' });
+
+  await softDeleteMessage(id, from);
+
+  const payload = {
+    type: 'message_deleted',
+    id,
+    from: original.from,
+    to: original.to,
+    forAll
+  };
+
+  sendToBoth(original.from, original.to, payload);
+}
+
+/* ============================================================
+   Reaction
+   ============================================================ */
+
+async function handleReaction(ws, msg) {
+  const from = ws.username;
+  const id = Number(msg.id);
+  const emoji = String(msg.emoji || '').trim();
+  const remove = Boolean(msg.remove);
+
+  if (!id) return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Неверные данные' });
+
+  const original = await getMessageById(id);
+  if (!original) return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Сообщение не найдено' });
+
+  if (remove) {
+    await removeReaction(id, from);
+  } else {
+    if (!emoji || emoji.length > 8) {
+      return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Неверный эмодзи' });
+    }
+    await addOrUpdateReaction(id, from, emoji);
+  }
+
+  const payload = {
+    type: remove ? 'reaction_removed' : 'reaction_added',
+    id,
+    from,
+    emoji: remove ? null : emoji,
+    to: original.from === from ? original.to : original.from
+  };
+
+  sendToBoth(original.from, original.to, payload);
+}
+
+/* ============================================================
+   Pin / Unpin
+   ============================================================ */
+
+async function handlePin(ws, msg) {
+  const from = ws.username;
+  const id = Number(msg.id);
+  if (!id) return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Неверные данные' });
+
+  const original = await getMessageById(id);
+  if (!original) return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Сообщение не найдено' });
+
+  const peer = original.from === from ? original.to : original.from;
+  const chatId = [from, peer].sort().join('__');
+
+  await pinMessage(chatId, id, from);
+
+  const payload = {
+    type: 'message_pinned',
+    chatId,
+    id,
+    from: original.from,
+    text: original.text,
+    pinnedBy: from,
+    ts: original.ts
+  };
+
+  sendToBoth(from, peer, payload);
+}
+
+async function handleUnpin(ws, msg) {
+  const from = ws.username;
+  const peer = String(msg.peer || '').toLowerCase().trim();
+  if (!peer) return safeSend(ws, { type: WS_TYPES.ERROR, message: 'Не указан чат' });
+
+  const chatId = [from, peer].sort().join('__');
+  await unpinMessage(chatId);
+
+  const payload = {
+    type: 'message_unpinned',
+    chatId
+  };
+
+  sendToBoth(from, peer, payload);
+}
+
+/* ============================================================
+   Утилиты
+   ============================================================ */
+
+function sendToBoth(userA, userB, obj) {
+  const payload = JSON.stringify(obj);
+
+  const setA = clients.get(userA);
+  if (setA) {
+    for (const sock of setA) {
+      if (sock.readyState === 1) sock.send(payload);
+    }
+  }
+
+  const setB = clients.get(userB);
+  if (setB) {
+    for (const sock of setB) {
+      if (sock.readyState === 1) sock.send(payload);
+    }
+  }
+}
 
 async function flushPending(ws, username) {
   try {
@@ -272,23 +422,22 @@ async function flushPending(ws, username) {
         to: row.to,
         text: row.text,
         ts: row.ts,
-        status: 'sent'
+        status: 'sent',
+        replyToId: row.reply_to_id || null,
+        editedAt: row.edited_at || null,
+        deleted: row.deleted || 0
       });
       ids.push(row.id);
     }
 
     if (ids.length) {
       await markDelivered(ids);
-      console.log(`📬 Доставлено ${ids.length} накопившихся сообщений для ${username}`);
+      console.log(`📩 Доставлено ${ids.length} накопившихся для ${username}`);
     }
   } catch (e) {
     console.error('[ws] flushPending error:', e);
   }
 }
-
-/* ============================================================
-   Presence
-   ============================================================ */
 
 function broadcastPresence(username, online) {
   const payload = JSON.stringify({
@@ -306,22 +455,31 @@ function broadcastPresence(username, online) {
 }
 
 /* ============================================================
-   Утилиты
+   Публичные функции
    ============================================================ */
 
-function safeSend(ws, obj) {
-  try {
-    if (ws.readyState === 1) {
-      ws.send(JSON.stringify(obj));
+export function broadcastProfileUpdate(username, profile) {
+  const payload = JSON.stringify({
+    type: 'profile_update',
+    username,
+    displayName: profile.display_name || '',
+    avatarEmoji: profile.avatar_emoji || '🙂',
+    bio: profile.bio || ''
+  });
+
+  for (const [otherUser, sockets] of clients) {
+    if (otherUser === username) continue;
+    for (const sock of sockets) {
+      if (sock.readyState === 1) sock.send(payload);
     }
-  } catch (e) {
-    // ignore
   }
 }
 
-/* ============================================================
-   Публичное API
-   ============================================================ */
+function safeSend(ws, obj) {
+  try {
+    if (ws.readyState === 1) ws.send(JSON.stringify(obj));
+  } catch (e) {}
+}
 
 export function isOnline(username) {
   const set = clients.get(username);
@@ -330,4 +488,4 @@ export function isOnline(username) {
 
 export function getOnlineUsers() {
   return Array.from(clients.keys());
-}
+       }
