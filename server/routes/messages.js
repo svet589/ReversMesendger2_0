@@ -8,7 +8,9 @@ import {
   getHistory,
   getLastMessage,
   userExists,
-  findUserByUsername
+  getReactionsForDialog,
+  getPinned,
+  getMessageById
 } from '../db.js';
 import { isOnline } from '../ws.js';
 import { LIMITS } from '../../shared/protocol.js';
@@ -17,17 +19,15 @@ const router = Router();
 
 /* ------------------------------------------------------------
    GET /api/messages/chats
-   Список чатов с последним сообщением.
-   ВАЖНО: этот роут теперь ДУБЛИРУЕТ /api/chats, оставлен для
-   обратной совместимости со старым клиентом.
+   Список чатов из messages (обратная совместимость).
+   Используется старым клиентом. Новый клиент ходит в /api/chats.
    ------------------------------------------------------------ */
 
 router.get('/chats', requireAuth, async (req, res) => {
   try {
     const me = req.username;
-
-    // Ищем все уникальные peer'ы из сообщений, где участвует me
     const { db } = await import('../db.js');
+
     const rows = await db.execute({
       sql: `
         SELECT
@@ -48,8 +48,9 @@ router.get('/chats', requireAuth, async (req, res) => {
 
     for (const row of rows.rows) {
       const peer = row.peer;
-      const user = await findUserByUsername(peer);
 
+      const { findUserByUsername } = await import('../db.js');
+      const user = await findUserByUsername(peer);
       if (!user) continue;
 
       const last = await getLastMessage(me, peer);
@@ -61,7 +62,7 @@ router.get('/chats', requireAuth, async (req, res) => {
         avatarEmoji: user.avatar_emoji || '🙂',
         online: isOnline(peer),
         lastTs: row.last_ts,
-        lastText: last ? last.text : '',
+        lastText: last && !last.deleted ? last.text : '',
         lastFrom: last ? last.from : null,
         lastStatus: last ? last.status : null
       });
@@ -76,7 +77,7 @@ router.get('/chats', requireAuth, async (req, res) => {
 
 /* ------------------------------------------------------------
    GET /api/messages/:peer
-   История переписки с конкретным пользователем.
+   История переписки + реакции + закреп.
    ------------------------------------------------------------ */
 
 router.get('/:peer', requireAuth, async (req, res) => {
@@ -98,16 +99,52 @@ router.get('/:peer', requireAuth, async (req, res) => {
       LIMITS.HISTORY_PAGE_SIZE
     );
 
+    // 1. Сообщения
     const history = await getHistory(me, peer, limit);
 
-    res.json(history.map(m => ({
-      id: m.id,
-      from: m.from,
-      to: m.to,
-      text: m.text,
-      ts: m.ts,
-      status: m.status
-    })));
+    // 2. Реакции
+    const reactionRows = await getReactionsForDialog(me, peer);
+    const reactionsMap = {};
+    for (const r of reactionRows) {
+      const key = r.message_id;
+      if (!reactionsMap[key]) reactionsMap[key] = [];
+      reactionsMap[key].push({ username: r.username, emoji: r.emoji });
+    }
+
+    // 3. Закреп
+    const chatId = [me, peer].sort().join('__');
+    const pinnedRow = await getPinned(chatId);
+    let pinned = null;
+
+    if (pinnedRow) {
+      const pm = await getMessageById(pinnedRow.message_id);
+      if (pm) {
+        pinned = {
+          id: pm.id,
+          text: pm.deleted ? '[сообщение удалено]' : pm.text,
+          from: pm.from,
+          ts: pm.ts,
+          pinnedBy: pinnedRow.pinned_by,
+          pinnedAt: pinnedRow.pinned_at
+        };
+      }
+    }
+
+    res.json({
+      messages: history.map(m => ({
+        id: m.id,
+        from: m.from,
+        to: m.to,
+        text: m.deleted ? '' : m.text,
+        ts: m.ts,
+        status: m.status,
+        replyToId: m.reply_to_id || null,
+        editedAt: m.edited_at || null,
+        deleted: m.deleted || 0,
+        reactions: reactionsMap[m.id] || []
+      })),
+      pinned
+    });
   } catch (e) {
     console.error('[messages/:peer]', e);
     res.status(500).json({ error: 'Ошибка загрузки истории' });
