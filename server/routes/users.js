@@ -5,14 +5,13 @@
 import { Router } from 'express';
 import { requireAuth } from '../auth.js';
 import { findUserByUsername, updateUser } from '../db.js';
-import { isOnline } from '../ws.js';
+import { isOnline, broadcastProfileUpdate } from '../ws.js';
 
 const router = Router();
 
 /* ------------------------------------------------------------
    GET /api/users/me
-   Свой профиль. Должно быть ДО /:username, иначе "me" уйдёт
-   в :username и вернёт "пользователь не найден".
+   Свой профиль. Должно быть ДО /:username.
    ------------------------------------------------------------ */
 
 router.get('/me', requireAuth, async (req, res) => {
@@ -48,16 +47,12 @@ router.patch('/me', requireAuth, async (req, res) => {
     const body = req.body || {};
     const fields = {};
 
-    // --- display_name ---
     if (body.displayName !== undefined) {
-      const v = String(body.displayName).trim().slice(0, 40);
-      fields.display_name = v;
+      fields.display_name = String(body.displayName).trim().slice(0, 40);
     }
 
-    // --- avatar_emoji ---
     if (body.avatarEmoji !== undefined) {
       const v = String(body.avatarEmoji).trim();
-      // берём только первый эмодзи-символ, максимум 8 байт utf-8
       if (v.length > 0 && v.length <= 8) {
         fields.avatar_emoji = v;
       } else {
@@ -65,16 +60,17 @@ router.patch('/me', requireAuth, async (req, res) => {
       }
     }
 
-    // --- bio ---
     if (body.bio !== undefined) {
-      const v = String(body.bio).trim().slice(0, 200);
-      fields.bio = v;
+      fields.bio = String(body.bio).trim().slice(0, 200);
     }
 
     const updated = await updateUser(req.username, fields);
     if (!updated) {
       return res.status(400).json({ error: 'Нет полей для обновления' });
     }
+
+    // Рассылаем всем онлайн-пользователям обновление профиля
+    broadcastProfileUpdate(req.username, updated);
 
     res.json({
       username: updated.username,
