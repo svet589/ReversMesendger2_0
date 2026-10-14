@@ -80,6 +80,33 @@ export async function initSchema() {
     ON chats(user_b);
   `);
 
+  // --- Реакции ---
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS reactions (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      message_id  INTEGER NOT NULL,
+      username    TEXT NOT NULL,
+      emoji       TEXT NOT NULL,
+      created_at  INTEGER NOT NULL,
+      UNIQUE(message_id, username)
+    );
+  `);
+
+  await db.execute(`
+    CREATE INDEX IF NOT EXISTS idx_reactions_message
+    ON reactions(message_id);
+  `);
+
+  // --- Закреплённые ---
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS pinned_messages (
+      chat_id    TEXT PRIMARY KEY,
+      message_id INTEGER NOT NULL,
+      pinned_by  TEXT NOT NULL,
+      pinned_at  INTEGER NOT NULL
+    );
+  `);
+
   console.log('✅ Схема БД готова');
 }
 
@@ -89,9 +116,15 @@ export async function initSchema() {
 
 export async function runMigrations() {
   const migrations = [
+    // Уровень 2 — Профили
     `ALTER TABLE users ADD COLUMN display_name TEXT`,
     `ALTER TABLE users ADD COLUMN avatar_emoji TEXT DEFAULT '🙂'`,
-    `ALTER TABLE users ADD COLUMN bio TEXT DEFAULT ''`
+    `ALTER TABLE users ADD COLUMN bio TEXT DEFAULT ''`,
+
+    // Уровень 3 — Работа с сообщениями
+    `ALTER TABLE messages ADD COLUMN reply_to_id INTEGER`,
+    `ALTER TABLE messages ADD COLUMN edited_at INTEGER`,
+    `ALTER TABLE messages ADD COLUMN deleted INTEGER DEFAULT 0`
   ];
 
   for (const sql of migrations) {
@@ -170,12 +203,12 @@ export async function updateUser(username, fields) {
    Сообщения
    ============================================================ */
 
-export async function saveMessage(fromUser, toUser, text) {
+export async function saveMessage(fromUser, toUser, text, replyToId = null) {
   const ts = Date.now();
   const res = await db.execute({
-    sql: `INSERT INTO messages (from_user, to_user, text, status, created_at)
-          VALUES (?, ?, ?, 'sent', ?)`,
-    args: [fromUser, toUser, text, ts]
+    sql: `INSERT INTO messages (from_user, to_user, text, status, created_at, reply_to_id)
+          VALUES (?, ?, ?, 'sent', ?, ?)`,
+    args: [fromUser, toUser, text, ts, replyToId]
   });
   return { id: Number(res.lastInsertRowid), ts };
 }
@@ -189,7 +222,10 @@ export async function getHistory(userA, userB, limit = 200) {
         to_user   AS "to",
         text,
         status,
-        created_at AS ts
+        created_at AS ts,
+        reply_to_id,
+        edited_at,
+        deleted
       FROM messages
       WHERE (from_user = ? AND to_user = ?)
          OR (from_user = ? AND to_user = ?)
@@ -210,7 +246,10 @@ export async function getLastMessage(userA, userB) {
         to_user   AS "to",
         text,
         status,
-        created_at AS ts
+        created_at AS ts,
+        reply_to_id,
+        edited_at,
+        deleted
       FROM messages
       WHERE (from_user = ? AND to_user = ?)
          OR (from_user = ? AND to_user = ?)
@@ -218,6 +257,123 @@ export async function getLastMessage(userA, userB) {
       LIMIT 1
     `,
     args: [userA, userB, userB, userA]
+  });
+  return res.rows[0] || null;
+}
+
+export async function getMessageById(id) {
+  const res = await db.execute({
+    sql: `SELECT
+            id,
+            from_user AS "from",
+            to_user   AS "to",
+            text,
+            status,
+            created_at AS ts,
+            reply_to_id,
+            edited_at,
+            deleted
+          FROM messages WHERE id = ? LIMIT 1`,
+    args: [id]
+  });
+  return res.rows[0] || null;
+}
+
+export async function editMessage(id, fromUser, newText) {
+  const ts = Date.now();
+  await db.execute({
+    sql: `UPDATE messages
+          SET text = ?, edited_at = ?
+          WHERE id = ? AND from_user = ?`,
+    args: [newText, ts, id, fromUser]
+  });
+  return getMessageById(id);
+}
+
+export async function softDeleteMessage(id, fromUser) {
+  await db.execute({
+    sql: `UPDATE messages
+          SET deleted = 1, text = ''
+          WHERE id = ? AND from_user = ?`,
+    args: [id, fromUser]
+  });
+  return getMessageById(id);
+}
+
+/* ============================================================
+   Реакции
+   ============================================================ */
+
+export async function addOrUpdateReaction(messageId, username, emoji) {
+  const ts = Date.now();
+  await db.execute({
+    sql: `INSERT INTO reactions (message_id, username, emoji, created_at)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(message_id, username)
+          DO UPDATE SET emoji = excluded.emoji, created_at = excluded.created_at`,
+    args: [messageId, username, emoji, ts]
+  });
+  return { messageId, username, emoji };
+}
+
+export async function removeReaction(messageId, username) {
+  await db.execute({
+    sql: `DELETE FROM reactions WHERE message_id = ? AND username = ?`,
+    args: [messageId, username]
+  });
+}
+
+export async function getReactionsForMessage(messageId) {
+  const res = await db.execute({
+    sql: `SELECT username, emoji FROM reactions WHERE message_id = ?`,
+    args: [messageId]
+  });
+  return res.rows;
+}
+
+export async function getReactionsForDialog(userA, userB) {
+  const res = await db.execute({
+    sql: `
+      SELECT r.message_id, r.username, r.emoji
+      FROM reactions r
+      JOIN messages m ON m.id = r.message_id
+      WHERE (m.from_user = ? AND m.to_user = ?)
+         OR (m.from_user = ? AND m.to_user = ?)
+    `,
+    args: [userA, userB, userB, userA]
+  });
+  return res.rows;
+}
+
+/* ============================================================
+   Закрепы
+   ============================================================ */
+
+export async function pinMessage(chatId, messageId, pinnedBy) {
+  const ts = Date.now();
+  await db.execute({
+    sql: `INSERT INTO pinned_messages (chat_id, message_id, pinned_by, pinned_at)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(chat_id)
+          DO UPDATE SET message_id = excluded.message_id,
+                        pinned_by = excluded.pinned_by,
+                        pinned_at = excluded.pinned_at`,
+    args: [chatId, messageId, pinnedBy, ts]
+  });
+}
+
+export async function unpinMessage(chatId) {
+  await db.execute({
+    sql: `DELETE FROM pinned_messages WHERE chat_id = ?`,
+    args: [chatId]
+  });
+}
+
+export async function getPinned(chatId) {
+  const res = await db.execute({
+    sql: `SELECT chat_id, message_id, pinned_by, pinned_at
+          FROM pinned_messages WHERE chat_id = ? LIMIT 1`,
+    args: [chatId]
   });
   return res.rows[0] || null;
 }
@@ -305,11 +461,14 @@ export async function getPendingMessages(toUser) {
             to_user   AS "to",
             text,
             status,
-            created_at AS ts
+            created_at AS ts,
+            reply_to_id,
+            edited_at,
+            deleted
           FROM messages
           WHERE to_user = ? AND status = 'sent'
           ORDER BY created_at ASC`,
     args: [toUser]
   });
   return res.rows;
-    }
+     }
